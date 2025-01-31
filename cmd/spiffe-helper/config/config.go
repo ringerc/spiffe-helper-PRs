@@ -32,6 +32,10 @@ type Config struct {
 	AgentAddress             string             `hcl:"agent_address"`
 	Cmd                      string             `hcl:"cmd"`
 	CmdArgs                  string             `hcl:"cmd_args"`
+	CmdArgsArray             []string           `hcl:"cmd_args_array"`
+	CmdAttachStdin           bool               `hcl:"cmd_attach_stdin"`
+	CmdForwardExitCode       bool               `hcl:"cmd_forward_exit_code"`
+	CmdWritePidFile          string             `hcl:"cmd_write_pid_file"`
 	PIDFileName              string             `hcl:"pid_file_name"`
 	CertDir                  string             `hcl:"cert_dir"`
 	CertFileMode             int                `hcl:"cert_file_mode"`
@@ -81,15 +85,47 @@ func ParseConfigFile(file string) (*Config, error) {
 }
 
 // ParseConfigFlagOverrides handles command line arguments that override config file settings
-func (c *Config) ParseConfigFlagOverrides(daemonModeFlag bool, daemonModeFlagName string) {
-	if isFlagPassed(daemonModeFlagName) {
+func (c *Config) ParseConfigFlagOverrides(log logrus.FieldLogger, cliFlags CLIFlags) error {
+	if isset, daemonModeFlag := cliFlags.DaemonModeFlag(); isset {
 		// If daemon mode is set by CLI this takes precedence
 		c.DaemonMode = &daemonModeFlag
+		log.Debugf("cli flags forced daemon_mode=%t", daemonModeFlag)
 	} else if c.DaemonMode == nil {
 		// If daemon mode is not set, then default to true
 		daemonMode := true
 		c.DaemonMode = &daemonMode
 	}
+
+	// If -command is specified, interpret remaining positional arguments
+	// as a command to run, overriding anything set in the config file's
+	// cmd and and cmd_args options. Standard input will also be attached.
+	//
+	// The -command flag is requried because older spiffe-helper versions
+	// completely ignored positional arguments. So working-but-incorrect
+	// configurations could break if we started interpreting them as
+	// commands. Warn the user if they're using positional arguments without
+	// the -command flag.
+	//
+	if positionalCommandFlag := cliFlags.PositionalCommandFlag(); positionalCommandFlag {
+		if flag.NArg() == 0 {
+			return errors.New("-command=true flag passed but no command specified on CLI")
+		}
+		if c.Cmd != "" {
+			log.Infof("Overriding config file cmd and cmd_args settings with CLI positional arguments")
+		}
+		// -command implies cmd_attach_stdin=true
+		c.CmdAttachStdin = true
+		// The first positional argument is the command to run, remaining ones are arguments
+		// as a vector, same as cmd_args_array in the config file.
+		positionalArgs := flag.Args()
+		c.Cmd = positionalArgs[0]
+		c.CmdArgs = ""
+		c.CmdArgsArray = positionalArgs[1:]
+	} else if flag.NArg() > 0 {
+		log.Warn("Positional arguments were supplied but will be ignored. Use -command=true to run them as a command.")
+	}
+
+	return nil
 }
 
 func (c *Config) ValidateConfig(log logrus.FieldLogger) error {
@@ -178,6 +214,10 @@ func (c *Config) ValidateConfig(log logrus.FieldLogger) error {
 		}
 	}
 
+	if len(c.CmdArgsArray) > 0 && c.CmdArgs != "" {
+		return errors.New("cmd_args and cmd_args_array are mutually exclusive")
+	}
+
 	return nil
 }
 
@@ -196,12 +236,15 @@ func (c *Config) checkForUnknownConfig() error {
 	return nil
 }
 
-func ParseConfig(configFile string, daemonModeFlag bool, daemonModeFlagName string) (*Config, error) {
+func ParseConfig(log logrus.FieldLogger, cliFlags CLIFlags) (*Config, error) {
+	configFile := cliFlags.ConfigFile()
 	hclConfig, err := ParseConfigFile(configFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse %q: %w", configFile, err)
 	}
-	hclConfig.ParseConfigFlagOverrides(daemonModeFlag, daemonModeFlagName)
+	if err := hclConfig.ParseConfigFlagOverrides(log, cliFlags); err != nil {
+		return nil, err
+	}
 	return hclConfig, nil
 }
 
@@ -210,7 +253,10 @@ func NewSidecarConfig(config *Config, log logrus.FieldLogger) *sidecar.Config {
 		AddIntermediatesToBundle: config.AddIntermediatesToBundle,
 		AgentAddress:             config.AgentAddress,
 		Cmd:                      config.Cmd,
-		CmdArgs:                  config.CmdArgs,
+		CmdArgsArray:             config.CmdArgsArray,
+		CmdAttachStdin:           config.CmdAttachStdin,
+		CmdWritePidFile:          config.CmdWritePidFile,
+		CmdForwardExitCode:       config.CmdForwardExitCode,
 		PIDFileName:              config.PIDFileName,
 		CertDir:                  config.CertDir,
 		CertFileMode:             fs.FileMode(config.CertFileMode),      //nolint:gosec
@@ -261,18 +307,6 @@ func countEmpty(configs ...string) int {
 	}
 
 	return cnt
-}
-
-// isFlagPassed tests to see if a command line argument was set at all or left empty
-func isFlagPassed(name string) bool {
-	var found bool
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
-		}
-	})
-
-	return found
 }
 
 // mapKeysToString returns a comma separated string with all the keys from a map

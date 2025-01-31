@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/bundle/jwtbundle"
@@ -127,6 +129,7 @@ func (s *Sidecar) RunDaemon(ctx context.Context) error {
 	return nil
 }
 
+// Do a one-shot run of spiffe-helper
 func (s *Sidecar) Run(ctx context.Context) error {
 	if err := s.setupClients(ctx); err != nil {
 		return err
@@ -230,22 +233,49 @@ func (s *Sidecar) updateCertificates(svidResponse *workloadapi.X509Context) {
 	}
 }
 
-// signalProcessCMD sends the renew signal to the process or starts it if its first time
-func (s *Sidecar) signalProcess() error {
-	if atomic.LoadInt32(&s.processRunning) == 0 {
-		cmdArgs, err := getCmdArgs(s.config.CmdArgs)
+// Launch the helper process specified in Cmd and CmdArgsArray or CmdArgs,
+// store it in the process attribute and start a goroutine to monitor its exit
+func (s *Sidecar) startProcess() error {
+	var cmdArgs []string
+	if len(s.config.CmdArgsArray) > 0 {
+		// An argument vector was supplied that we can use
+		// directly without having to parse and interpret it
+		cmdArgs = s.config.CmdArgsArray
+	} else if s.config.CmdArgs != "" {
+		// Parse legacy single-string arguments format
+		var err error
+		cmdArgs, err = getCmdArgs(s.config.CmdArgs)
 		if err != nil {
 			return fmt.Errorf("error parsing cmd arguments: %w", err)
 		}
+	}
 
-		cmd := exec.Command(s.config.Cmd, cmdArgs...) // #nosec
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("error executing process \"%v\": %w", s.config.Cmd, err)
+	cmd := exec.Command(s.config.Cmd, cmdArgs...) // #nosec
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	// Historically spiffe-helper did not attach stdin, but
+	// generally when running as a wrapper process, stdin should be
+	// forwarded to the child process.
+	if s.config.CmdAttachStdin {
+		cmd.Stdin = os.Stdin
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("error executing process \"%v\": %w", s.config.Cmd, err)
+	}
+	s.process = cmd.Process
+	if s.config.CmdWritePidFile != "" {
+		if err := os.WriteFile(s.config.CmdWritePidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
+			return fmt.Errorf("error writing sub-command pid file \"%s\": %w", s.config.CmdWritePidFile, err)
 		}
-		s.process = cmd.Process
-		go s.checkProcessExit()
+	}
+	go s.checkProcessExit()
+	return nil
+}
+
+// signalProcessCMD sends the renew signal to the process or starts it if its first time
+func (s *Sidecar) signalProcess() error {
+	if atomic.LoadInt32(&s.processRunning) == 0 {
+		s.startProcess()
 	} else {
 		if err := SignalProcess(s.process, s.config.RenewSignal); err != nil {
 			return err
@@ -275,13 +305,39 @@ func (s *Sidecar) signalPID() error {
 	return SignalProcess(pidProcess, s.config.RenewSignal)
 }
 
+// Propagate the child process's exit code to the spiffe-helper process so that
+// spiffe-helper can be used as a wrapper process. Only to be called when the child
+// process has terminated.
+func (s *Sidecar) exitWithChildProcessExitCode(pState *os.ProcessState) {
+	// If the child process was terminated by a signal, exit with a
+	// non-zero code. This is the same behavior as the bourne shell. The
+	// downside is that exit statuses of >127 of the child process cannot
+	// be differentiated from signal exits, but this is a limitation of the
+	// unix process interface as there's no way for a process to exit with
+	// a "signal exit" status without actually signalling itself to do so.
+	if !pState.Exited() && runtime.GOOS != "windows" {
+		if status, ok := pState.Sys().(syscall.WaitStatus); ok {
+			os.Exit(128 + int(status.Signal()))
+		}
+	}
+	// Propagate the child process's exit code
+	os.Exit(pState.ExitCode())
+}
+
 func (s *Sidecar) checkProcessExit() {
 	atomic.StoreInt32(&s.processRunning, 1)
-	_, err := s.process.Wait()
+	pState, err := s.process.Wait()
 	if err != nil {
 		s.config.Log.Errorf("error waiting for process exit: %v", err)
 	}
-
+	if s.config.CmdForwardExitCode {
+		// Exit, propagating the child process's exit code
+		s.exitWithChildProcessExitCode(pState)
+	}
+	// relaunch the process next we get a fresh cert.
+	// TODO: should really relaunch immediately, but then we need to
+	// consider back-off etc. Historical behaviour was to re-launch next
+	// cert renewal.
 	atomic.StoreInt32(&s.processRunning, 0)
 }
 

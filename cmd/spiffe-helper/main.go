@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,18 +12,19 @@ import (
 	"github.com/spiffe/spiffe-helper/pkg/sidecar"
 )
 
-const (
-	daemonModeFlagName = "daemon-mode"
-)
-
 func main() {
-	configFile := flag.String("config", "helper.conf", "<configFile> Configuration file path")
-	daemonModeFlag := flag.Bool(daemonModeFlagName, true, "Toggle running as a daemon to rotate X.509/JWT or just fetch and exit")
-	flag.Parse()
+	cliFlags := config.NewCLIFlags()
+	cliFlags.Parse()
 	log := logrus.WithField("system", "spiffe-helper")
 
-	log.Infof("Using configuration file: %q", *configFile)
-	hclConfig, err := config.ParseConfig(*configFile, *daemonModeFlag, daemonModeFlagName)
+	if configFile := cliFlags.ConfigFile(); configFile == "" {
+		log.Error("No configuration file provided")
+		os.Exit(1)
+	} else {
+		log.Infof("Using configuration file: %q", configFile)
+	}
+
+	hclConfig, err := config.ParseConfig(log, cliFlags)
 	if err != nil {
 		log.WithError(err).Errorf("failed to parse configuration")
 		os.Exit(1)

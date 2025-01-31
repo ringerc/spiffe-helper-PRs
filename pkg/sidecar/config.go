@@ -17,10 +17,29 @@ type Config struct {
 	// The path to the process to launch.
 	Cmd string
 
-	// The arguments of the process to launch.
+	// The arguments of the process to launch. Deprecated, use CmdArgsArray.
 	CmdArgs string
 
-	// Signal external process via PID file
+	// An argument vector to be passed to Cmd when invoking a command. If not empty,
+	// CmdArgs is ignored.
+	CmdArgsArray []string
+
+	// Should stdin be attached when running a sub-command? Historically spiffe-helper did not attach stdin,
+	// but generally when running as a wrapper process, stdin should be attached.
+	CmdAttachStdin bool
+
+	// Should the exit code of the external process be forwarded to spiffe-helper's own caller by exiting
+	// with the same code? If false, spiffe-helper will restart the child process when it exits instead
+	// of exiting itself.
+	CmdForwardExitCode bool
+
+	// Path to write the PID file for the external process to. If empty, no PID file will be written.
+	// Useful when the child process doesn't support its own pid file writing mechanism.
+	// It is not necessary to use this and set PIDFileName, it's only useful if you need to get the
+	// pid of the child process for use outside spiffe-helper.
+	CmdWritePidFile string
+
+	// Signal external process via PID file if non-empty.
 	PIDFileName string
 
 	// The directory name to store the x509s and/or JWTs.
