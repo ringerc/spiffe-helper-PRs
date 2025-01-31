@@ -99,6 +99,7 @@ func TestSidecar_RunDaemon(t *testing.T) {
 				JWTWriteStatus:  make(map[string]string),
 			},
 		},
+		exitFunc: func(_ *os.ProcessState, _ int) {},
 	}
 	defer close(sidecar.certReadyChan)
 

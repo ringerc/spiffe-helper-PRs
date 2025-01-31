@@ -34,6 +34,12 @@ type Sidecar struct {
 	process        *os.Process
 	certReadyChan  chan struct{}
 	health         Health
+	// To allow exit to be trapped in tests
+	exitFunc func(*os.ProcessState, int)
+	// to allow stdio to be redirected in tests
+	stdin  *os.File
+	stdout *os.File
+	stderr *os.File
 }
 
 type Health struct {
@@ -62,6 +68,11 @@ func New(config *Config) *Sidecar {
 				JWTWriteStatus:  make(map[string]string),
 			},
 		},
+		// So callers can hook into the exit function and for testing
+		exitFunc: func(_ *os.ProcessState, code int) { os.Exit(code) },
+		stdin:    os.Stdin,
+		stdout:   os.Stdout,
+		stderr:   os.Stderr,
 	}
 	for _, jwtConfig := range config.JWTSVIDs {
 		jwtSVIDFilename := path.Join(config.CertDir, jwtConfig.JWTSVIDFilename)
@@ -130,6 +141,8 @@ func (s *Sidecar) RunDaemon(ctx context.Context) error {
 }
 
 // Do a one-shot run of spiffe-helper
+// Any command provided is ignored.
+// TODO this should really run the command once then exit with its exit code instead
 func (s *Sidecar) Run(ctx context.Context) error {
 	if err := s.setupClients(ctx); err != nil {
 		return err
@@ -251,13 +264,13 @@ func (s *Sidecar) startProcess() error {
 	}
 
 	cmd := exec.Command(s.config.Cmd, cmdArgs...) // #nosec
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = s.stdout
+	cmd.Stderr = s.stderr
 	// Historically spiffe-helper did not attach stdin, but
 	// generally when running as a wrapper process, stdin should be
 	// forwarded to the child process.
 	if s.config.CmdAttachStdin {
-		cmd.Stdin = os.Stdin
+		cmd.Stdin = s.stdin
 	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("error executing process \"%v\": %w", s.config.Cmd, err)
@@ -317,11 +330,11 @@ func (s *Sidecar) exitWithChildProcessExitCode(pState *os.ProcessState) {
 	// a "signal exit" status without actually signalling itself to do so.
 	if !pState.Exited() && runtime.GOOS != "windows" {
 		if status, ok := pState.Sys().(syscall.WaitStatus); ok {
-			os.Exit(128 + int(status.Signal()))
+			s.exitFunc(pState, 128+int(status.Signal()))
 		}
 	}
 	// Propagate the child process's exit code
-	os.Exit(pState.ExitCode())
+	s.exitFunc(pState, pState.ExitCode())
 }
 
 func (s *Sidecar) checkProcessExit() {
