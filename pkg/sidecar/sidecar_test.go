@@ -20,6 +20,142 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	exampleSpiffeID = "spiffe://example.test/workload"
+)
+
+type sidecarTest struct {
+	rootCA    *spiffetest.CA
+	spiffeID  spiffeid.ID
+	svidChain []*x509.Certificate
+	svidKey   crypto.PrivateKey
+	svid      []*x509svid.SVID
+}
+
+func newSidecarTest(t *testing.T) *sidecarTest {
+	rootCA := spiffetest.NewCA(t)
+	// Create a single svid without intermediate
+	spiffeID, err := spiffeid.FromString(exampleSpiffeID)
+	require.NoError(t, err)
+	svidChain, svidKey := rootCA.CreateX509SVID(spiffeID.String())
+	require.Len(t, svidChain, 1)
+	svid := []*x509svid.SVID{
+		{
+			ID:           spiffeID,
+			Certificates: svidChain,
+			PrivateKey:   svidKey,
+		},
+	}
+
+	return &sidecarTest{
+		rootCA:    rootCA,
+		spiffeID:  spiffeID,
+		svidChain: svidChain,
+		svidKey:   svidKey,
+		svid:      svid,
+	}
+}
+
+func (s *sidecarTest) bundle() []*x509.Certificate {
+	return s.rootCA.Roots()
+}
+
+func (s *sidecarTest) x509Context() *workloadapi.X509Context {
+	return &workloadapi.X509Context{
+		Bundles: x509bundle.NewSet(x509bundle.FromX509Authorities(s.spiffeID.TrustDomain(), s.bundle())),
+		SVIDs:   s.svid,
+	}
+}
+
+// This only supports x509 for now, should be updated to support
+// JWT too like RunDaemon. Probably helpers to inject configs for each
+// of x509, jwt, etc, since we can support combos of them. Then the
+// NewSidecar can check what is enabled.
+func (s *sidecarTest) NewConfig(t *testing.T) *Config {
+	tmpdir := t.TempDir()
+	log, _ := test.NewNullLogger()
+	return &Config{
+		Cmd:                "echo",
+		CertDir:            tmpdir,
+		SVIDFileName:       "svid.pem",
+		SVIDKeyFileName:    "svid_key.pem",
+		SVIDBundleFileName: "svid_bundle.pem",
+		Log:                log,
+		CertFileMode:       os.FileMode(0644),
+		KeyFileMode:        os.FileMode(0600),
+		JWTBundleFileMode:  os.FileMode(0600),
+		JWTSVIDFileMode:    os.FileMode(0600),
+	}
+}
+
+// use with
+//
+//	          w := x509Watcher{&sidecar}
+//	          w.OnX509ContextUpdate(testCase.response)
+//		     select {
+//		     case <-sidecar.CertReadyChan():
+//		     // continue
+//		     case <-ctx.Done():
+//		     	require.NoError(t, ctx.Err())
+//		     }
+//
+// remember to defer close(sidecar.certReadyChan)
+func (s *sidecarTest) NewSidecar(t *testing.T, config *Config) *Sidecar {
+	return &Sidecar{
+		config:        config,
+		certReadyChan: make(chan struct{}, 1),
+		health: Health{
+			FileWriteStatuses: FileWriteStatuses{
+				X509WriteStatus: writeStatusUnwritten,
+				JWTWriteStatus:  make(map[string]string),
+			},
+		},
+		exitFunc: func(_ *os.ProcessState, _ int) {},
+	}
+}
+
+func (s *sidecarTest) MockUpdateCertificate(t *testing.T, sidecar *Sidecar) {
+	w := x509Watcher{sidecar}
+	w.OnX509ContextUpdate(s.x509Context())
+	select {
+	case <-sidecar.CertReadyChan():
+		// continue
+	case <-ctx.Done():
+		require.NoError(t, ctx.Err())
+	}
+}
+
+// Basic validation that the sidecar test itself runs
+// TODO assert cmd exits, and sidecar stays alive
+// TODO test with long running cmd and signal
+// TODO test for cmd restart
+func TestSidecar_TestCmdRuns(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	s := newSidecarTest(t)
+	config := s.NewConfig(t)
+	config.Cmd = "touch"
+
+	tmpdir := t.TempDir()
+	testfile := path.Join(tmpdir, "testfile")
+	config.CmdArgs = testfile
+
+	sidecar := s.NewSidecar(t, config)
+	defer close(sidecar.certReadyChan)
+
+	// TODO RunDaemon equiv
+	// TODO assert the cmd isn't running
+
+	// Pretend the workload API server sent a response
+	s.MockUpdateCertificate(t, sidecar)
+
+	// FIXME: need a channel to wait for the command to finish?
+	time.Sleep(1 * time.Second)
+
+	_, err := os.Stat(testfile)
+	require.NoError(t, err)
+}
+
 // Creates a Sidecar with a Mocked WorkloadAPIClient and tests that
 // running the Sidecar Daemon, when a SVID Response is sent to the
 // UpdateChan on the WorkloadAPI client, the PEM files are stored on disk
